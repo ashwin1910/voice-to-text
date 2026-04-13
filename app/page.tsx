@@ -5,6 +5,8 @@ import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 
 const WHISPER_LIMIT = 25 * 1024 * 1024; // 25 MB — OpenAI Whisper API ceiling
+const CHUNK_MINUTES = 10; // max minutes per chunk — shorter = less hallucination
+const COMPRESS_BITRATE = 64; // kbps — good balance for speech across languages
 
 const ACCEPTED =
   "audio/*,video/mp4,.m4a,.mp3,.wav,.webm,.ogg,.opus,.mp4,.mov,.3gp,.amr,.aac,.flac";
@@ -63,7 +65,7 @@ export default function Home() {
     await ffmpeg.writeFile(inputName, await fetchFile(inputFile));
     await ffmpeg.exec([
       "-i", inputName, "-ac", "1", "-ar", "16000",
-      "-b:a", "32k", "-y", "output.mp3",
+      "-b:a", `${COMPRESS_BITRATE}k`, "-y", "output.mp3",
     ]);
     const raw = await ffmpeg.readFile("output.mp3") as Uint8Array;
     const blob = new Blob([raw.slice().buffer as ArrayBuffer], { type: "audio/mpeg" });
@@ -77,9 +79,8 @@ export default function Home() {
   const splitAudio = useCallback(async (compressedFile: File): Promise<File[]> => {
     const ffmpeg = await loadFFmpeg();
     await ffmpeg.writeFile("full.mp3", await fetchFile(compressedFile));
-    const bytesPerSec = 32000 / 8;
-    const targetChunkBytes = WHISPER_LIMIT * 0.9;
-    const chunkDuration = Math.floor(targetChunkBytes / bytesPerSec);
+    const bytesPerSec = COMPRESS_BITRATE * 1000 / 8;
+    const chunkDuration = CHUNK_MINUTES * 60;
     const totalDuration = Math.ceil(compressedFile.size / bytesPerSec);
     const numChunks = Math.ceil(totalDuration / chunkDuration);
     const chunks: File[] = [];
@@ -135,6 +136,24 @@ export default function Home() {
   const [statusMsg, setStatusMsg] = useState("");
   const apiKeyRef = useRef("");
 
+  const stripHallucination = (text: string): string => {
+    const sentences = text.split(/(?<=[।.!?])\s*/);
+    const cleaned: string[] = [];
+    let repeatCount = 0;
+    for (let i = 0; i < sentences.length; i++) {
+      const s = sentences[i].trim();
+      if (!s) continue;
+      if (i > 0 && s === sentences[i - 1]?.trim()) {
+        repeatCount++;
+        if (repeatCount >= 2) continue;
+      } else {
+        repeatCount = 0;
+      }
+      cleaned.push(s);
+    }
+    return cleaned.join(" ");
+  };
+
   const getApiKey = async () => {
     if (apiKeyRef.current) return apiKeyRef.current;
     const res = await fetch("/api/config", { method: "POST" });
@@ -175,6 +194,17 @@ export default function Home() {
     return data;
   };
 
+  const estimateDurationMin = (f: File): number => {
+    const ext = f.name.split(".").pop()?.toLowerCase() || "";
+    const sizeBytes = f.size;
+    const bitsPerSec: Record<string, number> = {
+      mp3: 128000, m4a: 128000, aac: 128000, ogg: 112000, opus: 64000,
+      wav: 768000, flac: 500000, webm: 96000,
+    };
+    const bps = bitsPerSec[ext] || 128000;
+    return (sizeBytes * 8) / bps / 60;
+  };
+
   const submit = async () => {
     if (!file) return;
     setLoading(true);
@@ -187,16 +217,27 @@ export default function Home() {
       let fullTranscript = "";
       let summaryText = "";
 
-      if (file.size <= WHISPER_LIMIT) {
+      const needsSplit =
+        file.size > WHISPER_LIMIT || estimateDurationMin(file) > CHUNK_MINUTES;
+
+      if (!needsSplit) {
         setStatusMsg("Transcribing…");
-        fullTranscript = await transcribeFile(file);
+        fullTranscript = stripHallucination(await transcribeFile(file));
       } else {
+        // Compress if not already compressed (original files > 25 MB are
+        // compressed in handleFile, but long files ≤ 25 MB are not)
+        let audioToSplit = file;
+        if (file.size > WHISPER_LIMIT || !file.name.endsWith(".mp3") || !originalSize) {
+          setStatusMsg("Preparing audio…");
+          audioToSplit = await compressAudio(file);
+        }
+
         setStatusMsg("Splitting audio…");
-        const chunks = await splitAudio(file);
+        const chunks = await splitAudio(audioToSplit);
         const transcripts: string[] = [];
         for (let i = 0; i < chunks.length; i++) {
           setStatusMsg(`Transcribing part ${i + 1} of ${chunks.length}…`);
-          transcripts.push(await transcribeFile(chunks[i]));
+          transcripts.push(stripHallucination(await transcribeFile(chunks[i])));
         }
         fullTranscript = transcripts.join("\n\n");
       }
