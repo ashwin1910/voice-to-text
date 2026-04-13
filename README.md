@@ -7,7 +7,7 @@ Simple internal tool: drop an audio file, get a cleaned-up transcript + optional
 - Summarization: OpenAI `gpt-4o-mini` (only runs if you provide instructions)
 - Theme: Anthropic-inspired (warm cream + coral)
 
-Supports iPhone `.m4a`, Android `.m4a/.3gp/.amr/.opus`, plus `.mp3 .wav .ogg .webm .mp4 .mov .flac .aac`. File limit: **25 MB** (Whisper API ceiling).
+Supports iPhone `.m4a`, Android `.m4a/.3gp/.amr/.opus`, plus `.mp3 .wav .ogg .webm .mp4 .mov .flac .aac`. Files over 25 MB are **automatically compressed** in-browser using FFmpeg WASM (mono MP3, 48 kbps) before upload — no size limit from the user's perspective.
 
 ---
 

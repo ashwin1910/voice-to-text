@@ -242,6 +242,21 @@ h1 em {
 }
 .file-remove:hover { background: var(--bg-sunken); color: var(--error); }
 
+/* Compression progress bar */
+.compress-bar-track {
+  height: 4px;
+  background: var(--bg-sunken);
+  border-radius: 2px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+.compress-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
 /* Textarea */
 textarea {
   width: 100%;

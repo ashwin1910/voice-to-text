@@ -2,35 +2,37 @@ import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 
 export const runtime = "nodejs";
-export const maxDuration = 60; // seconds; bump on Vercel Pro if you need longer
+export const maxDuration = 60;
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+function jsonError(message: string, status = 500) {
+  return NextResponse.json({ error: message }, { status });
+}
 
 export async function POST(req: NextRequest) {
   try {
     if (!process.env.OPENAI_API_KEY) {
-      return NextResponse.json(
-        { error: "OPENAI_API_KEY not set on the server." },
-        { status: 500 }
-      );
+      return jsonError("OPENAI_API_KEY not set on the server.");
     }
 
-    const form = await req.formData();
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+    let form: FormData;
+    try {
+      form = await req.formData();
+    } catch (e: any) {
+      return jsonError("Failed to parse upload: " + (e?.message || "unknown"), 400);
+    }
+
     const file = form.get("file");
     const instructions = (form.get("instructions") as string) || "";
 
     if (!file || !(file instanceof File)) {
-      return NextResponse.json({ error: "No file uploaded." }, { status: 400 });
+      return jsonError("No file uploaded.", 400);
     }
     if (file.size > 25 * 1024 * 1024) {
-      return NextResponse.json(
-        { error: "File exceeds 25MB Whisper API limit." },
-        { status: 400 }
-      );
+      return jsonError("File exceeds 25 MB Whisper API limit.", 400);
     }
 
-    // Step 1 — Whisper transcription
-    // The OpenAI SDK accepts the web File object directly.
     const transcription = await openai.audio.transcriptions.create({
       file: file,
       model: "whisper-1",
@@ -42,7 +44,6 @@ export async function POST(req: NextRequest) {
         ? transcription
         : (transcription as any).text || "";
 
-    // Step 2 — Optional GPT summarization (only if instructions provided)
     let summary = "";
     if (instructions.trim()) {
       const chat = await openai.chat.completions.create({
@@ -66,9 +67,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ transcript, summary });
   } catch (err: any) {
     console.error("Transcribe error:", err);
-    return NextResponse.json(
-      { error: err?.message || "Transcription failed" },
-      { status: 500 }
-    );
+    const msg =
+      err?.status === 413
+        ? "File too large for the server. Try a shorter recording."
+        : err?.message || "Transcription failed";
+    return jsonError(msg);
   }
 }

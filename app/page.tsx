@@ -1,6 +1,10 @@
 "use client";
 
-import { useState, useRef, useEffect, DragEvent, ChangeEvent } from "react";
+import { useState, useRef, useEffect, useCallback, DragEvent, ChangeEvent } from "react";
+import { FFmpeg } from "@ffmpeg/ffmpeg";
+import { fetchFile, toBlobURL } from "@ffmpeg/util";
+
+const MAX_SIZE = 25 * 1024 * 1024;
 
 const ACCEPTED =
   "audio/*,video/mp4,.m4a,.mp3,.wav,.webm,.ogg,.opus,.mp4,.mov,.3gp,.amr,.aac,.flac";
@@ -23,7 +27,11 @@ export default function Home() {
   const [dragging, setDragging] = useState(false);
   const [copied, setCopied] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [compressing, setCompressing] = useState(false);
+  const [compressionProgress, setCompressionProgress] = useState(0);
+  const [originalSize, setOriginalSize] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const ffmpegRef = useRef<FFmpeg | null>(null);
 
   // elapsed timer during loading
   useEffect(() => {
@@ -33,15 +41,71 @@ export default function Home() {
     return () => clearInterval(t);
   }, [loading]);
 
-  const handleFile = (f: File | null) => {
+  const loadFFmpeg = useCallback(async () => {
+    if (ffmpegRef.current) return ffmpegRef.current;
+    const ffmpeg = new FFmpeg();
+    const baseURL = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+    ffmpeg.on("progress", ({ progress }) => {
+      setCompressionProgress(Math.max(0, Math.min(100, Math.round(progress * 100))));
+    });
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+    });
+    ffmpegRef.current = ffmpeg;
+    return ffmpeg;
+  }, []);
+
+  const compressAudio = useCallback(async (inputFile: File): Promise<File> => {
+    const ffmpeg = await loadFFmpeg();
+    const ext = inputFile.name.split(".").pop()?.toLowerCase() || "m4a";
+    await ffmpeg.writeFile(`input.${ext}`, await fetchFile(inputFile));
+    await ffmpeg.exec([
+      "-i", `input.${ext}`,
+      "-ac", "1",
+      "-ar", "16000",
+      "-b:a", "48k",
+      "-y",
+      "output.mp3",
+    ]);
+    const raw = await ffmpeg.readFile("output.mp3") as Uint8Array;
+    const blob = new Blob([raw.slice().buffer as ArrayBuffer], { type: "audio/mpeg" });
+    return new File(
+      [blob],
+      inputFile.name.replace(/\.[^.]+$/, ".mp3"),
+      { type: "audio/mpeg" },
+    );
+  }, [loadFFmpeg]);
+
+  const handleFile = async (f: File | null) => {
     setError("");
     setTranscript("");
     setSummary("");
-    if (!f) return setFile(null);
-    if (f.size > 25 * 1024 * 1024) {
-      setError("File too large. Whisper supports up to 25 MB. Please trim or compress.");
+    setOriginalSize(0);
+    if (!f) { setFile(null); return; }
+
+    if (f.size > MAX_SIZE) {
+      setOriginalSize(f.size);
+      setFile(f);
+      setCompressing(true);
+      setCompressionProgress(0);
+      try {
+        const compressed = await compressAudio(f);
+        if (compressed.size > MAX_SIZE) {
+          setError("Still too large after compression. Try trimming the audio to a shorter clip.");
+          setFile(null);
+          return;
+        }
+        setFile(compressed);
+      } catch (err: any) {
+        setError("Compression failed: " + (err?.message || "Unknown error"));
+        setFile(null);
+      } finally {
+        setCompressing(false);
+      }
       return;
     }
+
     setFile(f);
   };
 
@@ -63,7 +127,11 @@ export default function Home() {
       fd.append("file", file);
       fd.append("instructions", instructions);
       const res = await fetch("/api/transcribe", { method: "POST", body: fd });
-      const data = await res.json();
+      const text = await res.text();
+      let data: any;
+      try { data = JSON.parse(text); } catch {
+        throw new Error(text.slice(0, 120) || `Server error (${res.status})`);
+      }
       if (!res.ok) throw new Error(data.error || "Failed to transcribe");
       setTranscript(data.transcript || "");
       setSummary(data.summary || "");
@@ -102,7 +170,7 @@ export default function Home() {
         <div className="step">
           <span className="step-num">1</span>
           <span className="step-label">Upload audio</span>
-          <span className="step-hint">iPhone · Android · mp3 · wav · up to 25 MB</span>
+          <span className="step-hint">iPhone · Android · mp3 · wav · any size</span>
         </div>
         <div
           className={`dropzone ${dragging ? "dragging" : ""} ${file ? "has-file" : ""}`}
@@ -132,15 +200,37 @@ export default function Home() {
               </div>
               <div className="file-meta">
                 <div className="file-name">{file.name}</div>
-                <div className="file-size">{(file.size / 1024 / 1024).toFixed(2)} MB · ready</div>
+                <div className="file-size">
+                  {compressing ? (
+                    <>
+                      {(file.size / 1024 / 1024).toFixed(1)} MB · compressing… {compressionProgress}%
+                    </>
+                  ) : originalSize ? (
+                    <>
+                      {(originalSize / 1024 / 1024).toFixed(1)} MB → {(file.size / 1024 / 1024).toFixed(1)} MB · compressed · ready
+                    </>
+                  ) : (
+                    <>{(file.size / 1024 / 1024).toFixed(2)} MB · ready</>
+                  )}
+                </div>
+                {compressing && (
+                  <div className="compress-bar-track">
+                    <div
+                      className="compress-bar-fill"
+                      style={{ width: `${compressionProgress}%` }}
+                    />
+                  </div>
+                )}
               </div>
-              <button
-                className="file-remove"
-                onClick={(e) => { e.stopPropagation(); handleFile(null); }}
-                aria-label="Remove file"
-              >
-                ✕
-              </button>
+              {!compressing && (
+                <button
+                  className="file-remove"
+                  onClick={(e) => { e.stopPropagation(); handleFile(null); }}
+                  aria-label="Remove file"
+                >
+                  ✕
+                </button>
+              )}
             </div>
           )}
           <input
@@ -183,7 +273,7 @@ export default function Home() {
 
       <button
         className="btn-primary accent"
-        disabled={!file || loading}
+        disabled={!file || loading || compressing}
         onClick={submit}
       >
         {loading ? (
