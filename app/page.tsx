@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback, DragEvent, ChangeEvent } from
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 
-const UPLOAD_LIMIT = 4 * 1024 * 1024; // 4 MB — safe under Vercel Hobby's 4.5 MB payload cap
+const WHISPER_LIMIT = 25 * 1024 * 1024; // 25 MB — OpenAI Whisper API ceiling
 
 const ACCEPTED =
   "audio/*,video/mp4,.m4a,.mp3,.wav,.webm,.ogg,.opus,.mp4,.mov,.3gp,.amr,.aac,.flac";
@@ -61,32 +61,41 @@ export default function Home() {
     const ext = inputFile.name.split(".").pop()?.toLowerCase() || "m4a";
     const inputName = `input.${ext}`;
     await ffmpeg.writeFile(inputName, await fetchFile(inputFile));
-
-    let bitrate = 48;
     await ffmpeg.exec([
       "-i", inputName, "-ac", "1", "-ar", "16000",
-      "-b:a", `${bitrate}k`, "-y", "output.mp3",
+      "-b:a", "32k", "-y", "output.mp3",
     ]);
-    let raw = await ffmpeg.readFile("output.mp3") as Uint8Array;
-
-    // If first pass is still over limit, estimate duration and recalculate bitrate
-    if (raw.byteLength > UPLOAD_LIMIT) {
-      const estDurationSec = (raw.byteLength * 8) / (bitrate * 1000);
-      bitrate = Math.max(16, Math.floor((UPLOAD_LIMIT * 8 * 0.9) / estDurationSec / 1000));
-      setCompressionProgress(0);
-      await ffmpeg.exec([
-        "-i", inputName, "-ac", "1", "-ar", "16000",
-        "-b:a", `${bitrate}k`, "-y", "output.mp3",
-      ]);
-      raw = await ffmpeg.readFile("output.mp3") as Uint8Array;
-    }
-
+    const raw = await ffmpeg.readFile("output.mp3") as Uint8Array;
     const blob = new Blob([raw.slice().buffer as ArrayBuffer], { type: "audio/mpeg" });
     return new File(
       [blob],
       inputFile.name.replace(/\.[^.]+$/, ".mp3"),
       { type: "audio/mpeg" },
     );
+  }, [loadFFmpeg]);
+
+  const splitAudio = useCallback(async (compressedFile: File): Promise<File[]> => {
+    const ffmpeg = await loadFFmpeg();
+    await ffmpeg.writeFile("full.mp3", await fetchFile(compressedFile));
+    const bytesPerSec = 32000 / 8;
+    const targetChunkBytes = WHISPER_LIMIT * 0.9;
+    const chunkDuration = Math.floor(targetChunkBytes / bytesPerSec);
+    const totalDuration = Math.ceil(compressedFile.size / bytesPerSec);
+    const numChunks = Math.ceil(totalDuration / chunkDuration);
+    const chunks: File[] = [];
+    for (let i = 0; i < numChunks; i++) {
+      const start = i * chunkDuration;
+      const outName = `chunk${i}.mp3`;
+      await ffmpeg.exec([
+        "-i", "full.mp3", "-ss", String(start),
+        "-t", String(chunkDuration), "-c", "copy", "-y", outName,
+      ]);
+      const raw = await ffmpeg.readFile(outName) as Uint8Array;
+      if (raw.byteLength === 0) continue;
+      const blob = new Blob([raw.slice().buffer as ArrayBuffer], { type: "audio/mpeg" });
+      chunks.push(new File([blob], `chunk_${i + 1}.mp3`, { type: "audio/mpeg" }));
+    }
+    return chunks;
   }, [loadFFmpeg]);
 
   const handleFile = async (f: File | null) => {
@@ -96,18 +105,13 @@ export default function Home() {
     setOriginalSize(0);
     if (!f) { setFile(null); return; }
 
-    if (f.size > UPLOAD_LIMIT) {
+    if (f.size > WHISPER_LIMIT) {
       setOriginalSize(f.size);
       setFile(f);
       setCompressing(true);
       setCompressionProgress(0);
       try {
         const compressed = await compressAudio(f);
-        if (compressed.size > UPLOAD_LIMIT) {
-          setError("Still too large after compression. Try a shorter recording (under ~30 min).");
-          setFile(null);
-          return;
-        }
         setFile(compressed);
       } catch (err: any) {
         setError("Compression failed: " + (err?.message || "Unknown error"));
@@ -128,30 +132,93 @@ export default function Home() {
     if (f) handleFile(f);
   };
 
+  const [statusMsg, setStatusMsg] = useState("");
+  const apiKeyRef = useRef("");
+
+  const getApiKey = async () => {
+    if (apiKeyRef.current) return apiKeyRef.current;
+    const res = await fetch("/api/config", { method: "POST" });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    apiKeyRef.current = data.key;
+    return data.key;
+  };
+
+  const transcribeFile = async (f: File) => {
+    const key = await getApiKey();
+    const fd = new FormData();
+    fd.append("file", f);
+    fd.append("model", "whisper-1");
+    fd.append("response_format", "text");
+    const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}` },
+      body: fd,
+    });
+    if (!res.ok) {
+      const errBody = await res.text();
+      let msg: string;
+      try { msg = JSON.parse(errBody)?.error?.message || errBody; } catch { msg = errBody; }
+      throw new Error(msg.slice(0, 200) || `Whisper error (${res.status})`);
+    }
+    return await res.text();
+  };
+
+  const fetchJSON = async (url: string, init: RequestInit) => {
+    const res = await fetch(url, init);
+    const raw = await res.text();
+    let data: any;
+    try { data = JSON.parse(raw); } catch {
+      throw new Error(raw.slice(0, 120) || `Server error (${res.status})`);
+    }
+    if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+    return data;
+  };
+
   const submit = async () => {
     if (!file) return;
     setLoading(true);
     setError("");
     setTranscript("");
     setSummary("");
+    setStatusMsg("Preparing…");
+
     try {
-      const fd = new FormData();
-      fd.append("file", file);
-      fd.append("instructions", instructions);
-      const res = await fetch("/api/transcribe", { method: "POST", body: fd });
-      const text = await res.text();
-      let data: any;
-      try { data = JSON.parse(text); } catch {
-        throw new Error(text.slice(0, 120) || `Server error (${res.status})`);
+      let fullTranscript = "";
+      let summaryText = "";
+
+      if (file.size <= WHISPER_LIMIT) {
+        setStatusMsg("Transcribing…");
+        fullTranscript = await transcribeFile(file);
+      } else {
+        setStatusMsg("Splitting audio…");
+        const chunks = await splitAudio(file);
+        const transcripts: string[] = [];
+        for (let i = 0; i < chunks.length; i++) {
+          setStatusMsg(`Transcribing part ${i + 1} of ${chunks.length}…`);
+          transcripts.push(await transcribeFile(chunks[i]));
+        }
+        fullTranscript = transcripts.join("\n\n");
       }
-      if (!res.ok) throw new Error(data.error || "Failed to transcribe");
-      setTranscript(data.transcript || "");
-      setSummary(data.summary || "");
-      setActiveTab(data.summary ? "summary" : "transcript");
+
+      if (instructions.trim() && fullTranscript) {
+        setStatusMsg("Summarizing with GPT…");
+        const data = await fetchJSON("/api/summarize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ transcript: fullTranscript, instructions }),
+        });
+        summaryText = data.summary || "";
+      }
+
+      setTranscript(fullTranscript);
+      setSummary(summaryText);
+      setActiveTab(summaryText ? "summary" : "transcript");
     } catch (e: any) {
       setError(e.message || "Something went wrong");
     } finally {
       setLoading(false);
+      setStatusMsg("");
     }
   };
 
@@ -219,7 +286,11 @@ export default function Home() {
                     </>
                   ) : originalSize ? (
                     <>
-                      {(originalSize / 1024 / 1024).toFixed(1)} MB → {(file.size / 1024 / 1024).toFixed(1)} MB · compressed · ready
+                      {(originalSize / 1024 / 1024).toFixed(1)} MB → {(file.size / 1024 / 1024).toFixed(1)} MB · compressed
+                      {file.size > WHISPER_LIMIT
+                        ? ` · ${Math.ceil(file.size / (WHISPER_LIMIT * 0.9))} parts`
+                        : null}
+                      {" · ready"}
                     </>
                   ) : (
                     <>{(file.size / 1024 / 1024).toFixed(2)} MB · ready</>
@@ -317,13 +388,7 @@ export default function Home() {
               <span className="processing-bar" />
               <span className="processing-bar" />
             </div>
-            <span>
-              {elapsed < 5
-                ? "Uploading audio…"
-                : elapsed < 20
-                ? "Whisper is listening…"
-                : "Cleaning up with GPT…"}
-            </span>
+            <span>{statusMsg || "Processing…"} {elapsed}s</span>
           </div>
           <div className="shimmer-line" />
           <div className="shimmer-line" />
