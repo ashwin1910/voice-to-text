@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback, DragEvent, ChangeEvent } from
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 
-const MAX_SIZE = 25 * 1024 * 1024;
+const UPLOAD_LIMIT = 4 * 1024 * 1024; // 4 MB — safe under Vercel Hobby's 4.5 MB payload cap
 
 const ACCEPTED =
   "audio/*,video/mp4,.m4a,.mp3,.wav,.webm,.ogg,.opus,.mp4,.mov,.3gp,.amr,.aac,.flac";
@@ -59,16 +59,28 @@ export default function Home() {
   const compressAudio = useCallback(async (inputFile: File): Promise<File> => {
     const ffmpeg = await loadFFmpeg();
     const ext = inputFile.name.split(".").pop()?.toLowerCase() || "m4a";
-    await ffmpeg.writeFile(`input.${ext}`, await fetchFile(inputFile));
+    const inputName = `input.${ext}`;
+    await ffmpeg.writeFile(inputName, await fetchFile(inputFile));
+
+    let bitrate = 48;
     await ffmpeg.exec([
-      "-i", `input.${ext}`,
-      "-ac", "1",
-      "-ar", "16000",
-      "-b:a", "48k",
-      "-y",
-      "output.mp3",
+      "-i", inputName, "-ac", "1", "-ar", "16000",
+      "-b:a", `${bitrate}k`, "-y", "output.mp3",
     ]);
-    const raw = await ffmpeg.readFile("output.mp3") as Uint8Array;
+    let raw = await ffmpeg.readFile("output.mp3") as Uint8Array;
+
+    // If first pass is still over limit, estimate duration and recalculate bitrate
+    if (raw.byteLength > UPLOAD_LIMIT) {
+      const estDurationSec = (raw.byteLength * 8) / (bitrate * 1000);
+      bitrate = Math.max(16, Math.floor((UPLOAD_LIMIT * 8 * 0.9) / estDurationSec / 1000));
+      setCompressionProgress(0);
+      await ffmpeg.exec([
+        "-i", inputName, "-ac", "1", "-ar", "16000",
+        "-b:a", `${bitrate}k`, "-y", "output.mp3",
+      ]);
+      raw = await ffmpeg.readFile("output.mp3") as Uint8Array;
+    }
+
     const blob = new Blob([raw.slice().buffer as ArrayBuffer], { type: "audio/mpeg" });
     return new File(
       [blob],
@@ -84,15 +96,15 @@ export default function Home() {
     setOriginalSize(0);
     if (!f) { setFile(null); return; }
 
-    if (f.size > MAX_SIZE) {
+    if (f.size > UPLOAD_LIMIT) {
       setOriginalSize(f.size);
       setFile(f);
       setCompressing(true);
       setCompressionProgress(0);
       try {
         const compressed = await compressAudio(f);
-        if (compressed.size > MAX_SIZE) {
-          setError("Still too large after compression. Try trimming the audio to a shorter clip.");
+        if (compressed.size > UPLOAD_LIMIT) {
+          setError("Still too large after compression. Try a shorter recording (under ~30 min).");
           setFile(null);
           return;
         }
